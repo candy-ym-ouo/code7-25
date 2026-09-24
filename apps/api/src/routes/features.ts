@@ -485,8 +485,10 @@ export async function featureRoutes(app: FastifyInstance) {
     }).parse(request.body);
 
     await transaction(async (client) => {
+      // 锁定目标内容，使并发确认串行化：风险确认计数必须看到彼此已提交的行，
+      // 与举报阈值使用同一口径，避免多人同时确认时漏计导致不进复核队列。
       const feature = await client.query<{ status: string }>(
-        "SELECT status FROM map_features WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT status FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         [params.id]
       );
       if (feature.rows[0]?.status !== "published") throw notFound("Published feature not found");
@@ -511,9 +513,16 @@ export async function featureRoutes(app: FastifyInstance) {
         );
         if (risky.rows[0]!.count >= 3) {
           await client.query(
-            "UPDATE map_features SET needs_review_at = now(), updated_at = now() WHERE id = $1",
+            "UPDATE map_features SET needs_review_at = now(), updated_at = now() WHERE id = $1 AND needs_review_at IS NULL",
             [params.id]
           );
+          await recordAudit(client, {
+            actorId: request.user!.id,
+            action: "feature.freshness_threshold_flagged",
+            resourceType: "feature",
+            resourceId: params.id,
+            metadata: { riskyConfirmations: risky.rows[0]!.count, result: input.result }
+          });
         }
       }
     });

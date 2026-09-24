@@ -86,5 +86,6 @@
 | `POST` | `/moderation/comments/:id/approve` | 批准评论 |
 | `POST` | `/moderation/comments/:id/reject` | 拒绝评论 |
 | `POST` | `/moderation/comments/:id/hide` | 隐藏评论 |
-| `POST` | `/moderation/reports/:id/resolve` | 处理举报 |
+| `POST` | `/moderation/comments/:id/restore` | 管理员恢复评论 |
+| `POST` | `/moderation/reports/:id/resolve` | 处理举报（剩余 open 举报仍达阈值时 restore 被拒绝） |
 | `GET` | `/moderation/audit` | 管理员审计日志 |
