@@ -29,6 +29,8 @@ type ReportItem = {
   notes: string | null;
   created_at: string;
   reporter_name: string;
+  target_status: string | null;
+  target_deleted: boolean | null;
 };
 type Queue = {
   counts: { features: number; comments: number; media: number; reports: number };
@@ -181,7 +183,13 @@ onMounted(load);
 
     <div v-if="active === 'reports'" class="moderation-grid">
       <article v-for="item in queue.reports" :key="item.id" class="card"><div class="card-body">
-        <div class="inline"><span class="badge pending">{{ item.target_type }}</span><span class="badge">{{ item.reason_code }}</span></div>
+        <div class="inline">
+          <span class="badge pending">{{ item.target_type }}</span>
+          <span class="badge" :class="{ rejected: item.target_deleted, hidden: item.target_status === 'hidden' }">
+            目标：{{ item.target_deleted ? "已删除" : (item.target_status ?? "不存在") }}
+          </span>
+          <span class="badge">{{ item.reason_code }}</span>
+        </div>
         <p>{{ item.notes || "无补充说明" }}</p>
         <p class="muted">举报人：{{ item.reporter_name }} · {{ new Date(item.created_at).toLocaleString() }}</p>
         <p class="muted">目标 ID：{{ item.target_id }}</p>

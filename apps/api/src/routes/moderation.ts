@@ -1,11 +1,19 @@
 import type { FastifyInstance } from "fastify";
+import type { PoolClient } from "pg";
 import { z } from "zod";
 import { moderationDecisionSchema } from "@map/shared/contracts";
 import { query, transaction } from "../db";
-import { AppError, conflict, notFound } from "../errors";
+import { conflict, notFound } from "../errors";
 import { requireAdmin, requireModerator } from "../auth";
 import { recordAudit } from "../audit";
 import { notifyUser } from "../notifications";
+import {
+  dismissOpenReports,
+  hideTarget,
+  lockTarget,
+  restoreTarget,
+  type ReportTargetType
+} from "../moderation-state";
 
 export async function moderationRoutes(app: FastifyInstance) {
   app.get("/moderation/queue", { preHandler: requireModerator }, async () => {
@@ -35,8 +43,19 @@ export async function moderationRoutes(app: FastifyInstance) {
       ),
       query(
         `SELECT r.id, r.target_type, r.target_id, r.reason_code, r.notes, r.created_at,
-                u.display_name AS reporter_name
-         FROM reports r JOIN users u ON u.id = r.reporter_id
+                u.display_name AS reporter_name,
+                CASE r.target_type
+                  WHEN 'feature' THEN f.status
+                  ELSE c.status
+                END AS target_status,
+                CASE
+                  WHEN r.target_type = 'feature' THEN f.deleted_at IS NOT NULL
+                  ELSE c.deleted_at IS NOT NULL
+                END AS target_deleted
+         FROM reports r
+         JOIN users u ON u.id = r.reporter_id
+         LEFT JOIN map_features f ON r.target_type = 'feature' AND f.id = r.target_id
+         LEFT JOIN comments c ON r.target_type = 'comment' AND c.id = r.target_id
          WHERE r.status = 'open'
          ORDER BY r.created_at ASC LIMIT 100`
       )
@@ -85,6 +104,12 @@ export async function moderationRoutes(app: FastifyInstance) {
         }
       }
 
+      const featureBefore = await client.query<{ status: string }>(
+        "SELECT status FROM map_features WHERE id = $1 FOR UPDATE",
+        [params.id]
+      );
+      const previousStatus = featureBefore.rows[0]?.status;
+
       await client.query(
         `UPDATE feature_revisions
          SET status = 'published', reviewed_at = now(), reviewer_id = $2,
@@ -113,12 +138,24 @@ export async function moderationRoutes(app: FastifyInstance) {
           revision.payload.locationAccuracyM
         ]
       );
+      // A hidden feature only becomes public again through a moderator
+      // decision; approving a revision is that decision, so the open reports
+      // that justified the hide belong to the previous round and must not be
+      // counted against the newly published version.
+      const dismissedReports = previousStatus === "hidden"
+        ? await dismissOpenReports(client, "feature", params.id, request.user!.id)
+        : 0;
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "feature.approved",
         resourceType: "feature",
         resourceId: params.id,
-        metadata: { revisionId: revision.id }
+        metadata: {
+          revisionId: revision.id,
+          previousStatus,
+          nextStatus: "published",
+          dismissedOpenReports: dismissedReports
+        }
       });
       await notifyUser(client, {
         userId: revision.author_id,
@@ -209,21 +246,33 @@ export async function moderationRoutes(app: FastifyInstance) {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
     await transaction(async (client) => {
-      const result = await client.query(
-        "UPDATE map_features SET status = 'hidden', updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING owner_id, current_revision_id",
+      const before = await client.query<{ status: string; owner_id: string }>(
+        "SELECT status, owner_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         [params.id]
       );
-      const feature = result.rows[0];
-      if (!feature) throw notFound("Feature not found");
+      const current = before.rows[0];
+      if (!current) throw notFound("Feature not found");
+      if (current.status === "hidden") {
+        return { alreadyHidden: true };
+      }
+      if (current.status !== "published") throw conflict("Only published content can be hidden");
+      await hideTarget(client, "feature", params.id);
+      const dismissedReports = await dismissOpenReports(client, "feature", params.id, request.user!.id);
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "feature.hidden",
         resourceType: "feature",
         resourceId: params.id,
-        metadata: { reasonCode: input.reasonCode, notes: input.notes }
+        metadata: {
+          reasonCode: input.reasonCode,
+          notes: input.notes,
+          previousStatus: current.status,
+          nextStatus: "hidden",
+          dismissedOpenReports: dismissedReports
+        }
       });
       await notifyUser(client, {
-        userId: feature.owner_id,
+        userId: current.owner_id,
         type: "feature_hidden",
         title: "你的地点细节已被隐藏",
         body: `${input.reasonCode}${input.notes ? `：${input.notes}` : ""}`,
@@ -236,19 +285,17 @@ export async function moderationRoutes(app: FastifyInstance) {
   app.post("/moderation/features/:id/restore", { preHandler: requireAdmin }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     await transaction(async (client) => {
-      const result = await client.query<{ current_revision_id: string | null }>(
-        "SELECT current_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
-        [params.id]
-      );
-      const feature = result.rows[0];
-      if (!feature) throw notFound("Feature not found");
-      if (!feature.current_revision_id) throw conflict("Feature has no approved revision");
-      await client.query("UPDATE map_features SET status = 'published', updated_at = now() WHERE id = $1", [params.id]);
+      const result = await restoreTarget(client, "feature", params.id, { reviewerId: request.user!.id });
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "feature.restored",
         resourceType: "feature",
-        resourceId: params.id
+        resourceId: params.id,
+        metadata: {
+          previousStatus: result.previousStatus,
+          nextStatus: "published",
+          dismissedOpenReports: result.siblingsDismissed
+        }
       });
     });
     return { status: "published" };
@@ -316,20 +363,57 @@ export async function moderationRoutes(app: FastifyInstance) {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
     await transaction(async (client) => {
-      const result = await client.query(
-        "UPDATE comments SET status = 'hidden', updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING id",
+      const before = await client.query<{ status: string; author_id: string }>(
+        "SELECT status, author_id FROM comments WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         [params.id]
       );
-      if (!result.rowCount) throw notFound("Comment not found");
+      const current = before.rows[0];
+      if (!current) throw notFound("Comment not found");
+      if (current.status === "hidden") return;
+      if (current.status !== "published") throw conflict("Only published content can be hidden");
+      await hideTarget(client, "comment", params.id);
+      const dismissedReports = await dismissOpenReports(client, "comment", params.id, request.user!.id);
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "comment.hidden",
         resourceType: "comment",
         resourceId: params.id,
-        metadata: { reasonCode: input.reasonCode, notes: input.notes }
+        metadata: {
+          reasonCode: input.reasonCode,
+          notes: input.notes,
+          previousStatus: current.status,
+          nextStatus: "hidden",
+          dismissedOpenReports: dismissedReports
+        }
+      });
+      await notifyUser(client, {
+        userId: current.author_id,
+        type: "comment_hidden",
+        title: "你的评论已被隐藏",
+        body: `${input.reasonCode}${input.notes ? `：${input.notes}` : ""}`,
+        link: "/me/comments"
       });
     });
     return { status: "hidden" };
+  });
+
+  app.post("/moderation/comments/:id/restore", { preHandler: requireAdmin }, async (request) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    await transaction(async (client) => {
+      const result = await restoreTarget(client, "comment", params.id, { reviewerId: request.user!.id });
+      await recordAudit(client, {
+        actorId: request.user!.id,
+        action: "comment.restored",
+        resourceType: "comment",
+        resourceId: params.id,
+        metadata: {
+          previousStatus: result.previousStatus,
+          nextStatus: "published",
+          dismissedOpenReports: result.siblingsDismissed
+        }
+      });
+    });
+    return { status: "published" };
   });
 
   app.post("/moderation/reports/:id/resolve", { preHandler: requireModerator }, async (request) => {
@@ -341,23 +425,45 @@ export async function moderationRoutes(app: FastifyInstance) {
     }).parse(request.body);
 
     await transaction(async (client) => {
-      const reportResult = await client.query<{ target_type: string; target_id: string; reporter_id: string }>(
+      const reportResult = await client.query<{ target_type: ReportTargetType; target_id: string; reporter_id: string }>(
         "SELECT target_type, target_id, reporter_id FROM reports WHERE id = $1 AND status = 'open' FOR UPDATE",
         [params.id]
       );
       const report = reportResult.rows[0];
       if (!report) throw notFound("Open report not found");
 
+      let previousTargetStatus: string | undefined;
+      let nextTargetStatus: string | undefined;
+      let siblingsDismissed = 0;
+
       if (input.action === "hide") {
-        const table = report.target_type === "feature" ? "map_features" : "comments";
-        await client.query(`UPDATE ${table} SET status = 'hidden', updated_at = now() WHERE id = $1`, [report.target_id]);
-      }
-      if (input.action === "restore") {
-        if (report.target_type === "feature") {
-          await client.query("UPDATE map_features SET status = 'published', updated_at = now() WHERE id = $1 AND current_revision_id IS NOT NULL", [report.target_id]);
-        } else {
-          await client.query("UPDATE comments SET status = 'published', updated_at = now() WHERE id = $1", [report.target_id]);
+        // Locking the target here prevents racing a concurrent report that is
+        // itself holding the target lock for its threshold evaluation.
+        const target = await lockTarget(client, report.target_type, report.target_id);
+        previousTargetStatus = target.status;
+        const hide = await hideTarget(client, report.target_type, report.target_id);
+        nextTargetStatus = "hidden";
+        if (hide.changed) {
+          // The other open reports belong to the same moderation round and are
+          // covered by this explicit decision; close them with a single audit.
+          siblingsDismissed = await dismissOpenReports(
+            client,
+            report.target_type,
+            report.target_id,
+            request.user!.id,
+            params.id
+          );
         }
+      }
+
+      if (input.action === "restore") {
+        const restore = await restoreTarget(client, report.target_type, report.target_id, {
+          reviewerId: request.user!.id,
+          keepReportId: params.id
+        });
+        previousTargetStatus = restore.previousStatus;
+        nextTargetStatus = "published";
+        siblingsDismissed = restore.siblingsDismissed;
       }
 
       await client.query(
@@ -369,7 +475,16 @@ export async function moderationRoutes(app: FastifyInstance) {
         action: "report.resolved",
         resourceType: "report",
         resourceId: params.id,
-        metadata: { status: input.status, action: input.action, notes: input.notes, targetType: report.target_type, targetId: report.target_id }
+        metadata: {
+          status: input.status,
+          action: input.action,
+          notes: input.notes,
+          targetType: report.target_type,
+          targetId: report.target_id,
+          previousTargetStatus,
+          nextTargetStatus,
+          siblingsDismissed
+        }
       });
       await notifyUser(client, {
         userId: report.reporter_id,
